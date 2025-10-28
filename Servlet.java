@@ -1,52 +1,157 @@
-package local.ptdemo.appsec.workshop.llm;
+import org.apache.commons.validator.routines.UrlValidator;
+import org.owasp.encoder.Encode;
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
 
-import lombok.SneakyThrows;
-
+import javax.servlet.ServletException;
+import javax.servlet.ServletOutputStream;
 import javax.servlet.annotation.WebServlet;
 import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
-import java.io.PrintWriter;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.ResultSet;
-import java.sql.Statement;
+import java.io.*;
+import java.net.*;
+import java.util.Arrays;
+import java.util.concurrent.TimeUnit;
 
-@WebServlet("/llm")
-public class Servlet extends HttpServlet {
-    @SneakyThrows
+@WebServlet("/secure-cache")
+public class SecureImageCacheServlet extends HttpServlet {
+
+    // Настройки
+    private static final long MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
+    private static final int CONNECT_TIMEOUT = 5000; // 5 секунд
+    private static final int READ_TIMEOUT = 5000;    // 5 секунд
+    private static final int MAX_CACHE_SIZE = 100;   // Максимум 100 элементов
+
+    // LRU-кэш с ограниченным размером и TTL
+    private final Cache<String, byte[]> cache = CacheBuilder.newBuilder()
+            .maximumSize(MAX_CACHE_SIZE)
+            .expireAfterWrite(1, TimeUnit.HOURS)
+            .build();
+
+    // Валидатор URL (проверяет только HTTP/HTTPS)
+    private final UrlValidator urlValidator = new UrlValidator(new String[]{"http", "https"});
+
     @Override
-	protected void doGet(HttpServletRequest request, HttpServletResponse response) {
-        String name = request.getParameter("name");
-        if (name == null) return;
+    protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
+        // Уязвимость: Аутентификация/авторизация
+        // TODO: Реализовать проверку токена или сессии здесь (например, req.getHeader("Authorization"))
+        // Для примера, просто проверим наличие заголовка
+        String authHeader = req.getHeader("Authorization");
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            resp.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+            resp.getWriter().println("Unauthorized");
+            return;
+        }
 
-        String query = "SELECT * FROM users WHERE username = ?";
+        String imageUrlParam = req.getParameter("url");
 
-        try (Connection c = DriverManager.getConnection("jdbc:mysql://localhost/test", "user", "pass");
-             PreparedStatement ps = c.prepareStatement(query)) {
+        if (imageUrlParam == null || imageUrlParam.trim().isEmpty()) {
+            resp.setStatus(HttpServletResponse.SC_BAD_REQUEST);
+            resp.getWriter().println("URL parameter is required.");
+            return;
+        }
 
-            ps.setString(1, name);
+        // Экранируем параметр для вывода (XSS)
+        String safeUrlParam = Encode.forHtml(imageUrlParam);
 
-            try (ResultSet rs = ps.executeQuery();
-                 var out = response.getWriter()) {
+        // Валидация URL
+        if (!urlValidator.isValid(imageUrlParam)) {
+            resp.setStatus(HttpServletResponse.SC_BAD_REQUEST);
+            resp.getWriter().println("Invalid URL format: " + safeUrlParam);
+            return;
+        }
 
-                while (rs.next()) {
-                    // Экранируем данные перед выводом
-                    String username = Encode.forHtml(rs.getString("username"));
-                    String email = Encode.forHtml(rs.getString("email"));
-                    out.println(username + " - " + email);
-                }
+        URL imageUrl;
+        try {
+            imageUrl = new URL(imageUrlParam);
+        } catch (MalformedURLException e) {
+            resp.setStatus(HttpServletResponse.SC_BAD_REQUEST);
+            resp.getWriter().println("Malformed URL: " + safeUrlParam);
+            return;
+        }
+
+        // Проверка на внутренние IP (SSRF)
+        InetAddress addr = InetAddress.getByName(imageUrl.getHost());
+        if (addr.isLoopbackAddress() || addr.isSiteLocalAddress()) {
+            resp.setStatus(HttpServletResponse.SC_BAD_REQUEST);
+            resp.getWriter().println("Access to local/network addresses is forbidden.");
+            return;
+        }
+
+        // Проверяем кэш
+        byte[] cachedImage = cache.getIfPresent(imageUrlParam);
+        if (cachedImage != null) {
+            // Устанавливаем безопасные заголовки
+            resp.setContentType("image/jpeg"); // или определять по MIME-типу, если известен
+            resp.setContentLength(cachedImage.length);
+            try (ServletOutputStream out = resp.getOutputStream()) {
+                out.write(cachedImage);
             }
-        } catch (SQLException | java.io.IOException e) {
-            e.printStackTrace(); // или используйте логгер
-            response.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
+            return;
+        }
+
+        // Скачивание
+        byte[] imageData = downloadImageSafely(imageUrl);
+        if (imageData == null) {
+            resp.setStatus(HttpServletResponse.SC_NOT_FOUND);
+            resp.getWriter().println("Failed to download image from: " + safeUrlParam);
+            return;
+        }
+
+        // Проверка MIME-типа и расширения (опционально)
+        String contentType = URLConnection.guessContentTypeFromStream(new ByteArrayInputStream(imageData));
+        if (contentType == null || !contentType.startsWith("image/")) {
+            resp.setStatus(HttpServletResponse.SC_UNSUPPORTED_MEDIA_TYPE);
+            resp.getWriter().println("Content is not a valid image: " + contentType);
+            return;
+        }
+
+        // Кэшируем
+        cache.put(imageUrlParam, imageData);
+
+        // Устанавливаем безопасные заголовки
+        resp.setContentType(contentType);
+        resp.setContentLength(imageData.length);
+        try (ServletOutputStream out = resp.getOutputStream()) {
+            out.write(imageData);
         }
     }
-}
 
-    @SneakyThrows
-    @Override
-    protected void doPost(HttpServletRequest request,
-                         HttpServletResponse response) {
+    private byte[] downloadImageSafely(URL imageUrl) {
+        try {
+            HttpURLConnection connection = (HttpURLConnection) imageUrl.openConnection();
+            connection.setRequestMethod("GET");
+            connection.setConnectTimeout(CONNECT_TIMEOUT);
+            connection.setReadTimeout(READ_TIMEOUT);
+
+            // Проверка размера файла (опционально, если сервер отдает Content-Length)
+            long contentLength = connection.getContentLengthLong();
+            if (contentLength > MAX_FILE_SIZE) {
+                System.err.println("File too large: " + contentLength + " bytes.");
+                return null;
+            }
+
+            try (InputStream in = connection.getInputStream()) {
+                ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+                byte[] data = new byte[8192];
+                int nRead;
+                long totalRead = 0;
+
+                while ((nRead = in.read(data, 0, data.length)) != -1) {
+                    totalRead += nRead;
+                    if (totalRead > MAX_FILE_SIZE) {
+                        System.err.println("Downloaded file exceeded max size: " + totalRead);
+                        return null;
+                    }
+                    buffer.write(data, 0, nRead);
+                }
+                return buffer.toByteArray();
+            }
+        } catch (IOException e) {
+            // Не утечка информации
+            System.err.println("Error downloading image: " + e.getMessage());
+            return null;
+        }
     }
 }
