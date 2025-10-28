@@ -31,10 +31,15 @@ public class Servlet extends HttpServlet {
                  var out = response.getWriter()) {
 
                 while (rs.next()) {
-                    // Экранируем данные перед выводом
-                    String username = Encode.forHtml(rs.getString("username"));
-                    String email = Encode.forHtml(rs.getString("email"));
-                    out.println(username + " - " + email);
+                    // Экранируем каждую часть отдельно
+                    String safeUsername = Encode.forHtml(rs.getString("username"));
+                    String safeEmail = Encode.forHtml(rs.getString("email"));
+
+                    // Конкатенируем уже безопасные строки
+                    String output = safeUsername + " - " + safeEmail;
+
+                    // Выводим безопасную строку
+                    out.println(output);
                 }
             }
         } catch (SQLException | java.io.IOException e) {
