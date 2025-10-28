@@ -1,7 +1,7 @@
-import org.apache.commons.validator.routines.UrlValidator;
-import org.owasp.encoder.Encode;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
+import org.apache.commons.validator.routines.UrlValidator;
+import org.owasp.encoder.Encode;
 
 import javax.servlet.ServletException;
 import javax.servlet.ServletOutputStream;
@@ -11,54 +11,60 @@ import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import java.io.*;
 import java.net.*;
-import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 @WebServlet("/secure-cache")
 public class SecureImageCacheServlet extends HttpServlet {
 
-    // Настройки
-    private static final long MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
-    private static final int CONNECT_TIMEOUT = 5000; // 5 секунд
-    private static final int READ_TIMEOUT = 5000;    // 5 секунд
-    private static final int MAX_CACHE_SIZE = 100;   // Максимум 100 элементов
+    // === Настройки безопасности ===
+    private static final long MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10 МБ
+    private static final int CONNECT_TIMEOUT_MS = 5000;
+    private static final int READ_TIMEOUT_MS = 5000;
+    private static final int MAX_CACHE_ENTRIES = 100;
+    private static final long RATE_LIMIT_WINDOW_SECONDS = 60;
+    private static final long MAX_REQUESTS_PER_WINDOW = 100;
 
-    // LRU-кэш с ограниченным размером и TTL
-    private final Cache<String, byte[]> cache = CacheBuilder.newBuilder()
-            .maximumSize(MAX_CACHE_SIZE)
+    // === Безопасный LRU-кэш с TTL ===
+    private final Cache<String, byte[]> imageCache = CacheBuilder.newBuilder()
+            .maximumSize(MAX_CACHE_ENTRIES)
             .expireAfterWrite(1, TimeUnit.HOURS)
             .build();
 
-    // Валидатор URL (проверяет только HTTP/HTTPS)
+    // === Rate limiting (упрощённый вариант на основе счётчика) ===
+    private final AtomicLong requestCount = new AtomicLong(0);
+    private volatile long windowStart = System.currentTimeMillis();
+
+    // === Валидатор URL (только http/https) ===
     private final UrlValidator urlValidator = new UrlValidator(new String[]{"http", "https"});
 
     @Override
     protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
-        // Уязвимость: Аутентификация/авторизация
-        // TODO: Реализовать проверку токена или сессии здесь (например, req.getHeader("Authorization"))
-        // Для примера, просто проверим наличие заголовка
+        // === 1. Rate Limiting ===
+        enforceRateLimit(resp);
+
+        // === 2. Аутентификация (пример: Bearer токен) ===
         String authHeader = req.getHeader("Authorization");
-        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+        if (!isValidAuthToken(authHeader)) {
             resp.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
-            resp.getWriter().println("Unauthorized");
+            resp.getWriter().println("Missing or invalid Authorization header.");
             return;
         }
 
+        // === 3. Получение и валидация URL ===
         String imageUrlParam = req.getParameter("url");
-
-        if (imageUrlParam == null || imageUrlParam.trim().isEmpty()) {
+        if (imageUrlParam == null || imageUrlParam.isBlank()) {
             resp.setStatus(HttpServletResponse.SC_BAD_REQUEST);
-            resp.getWriter().println("URL parameter is required.");
+            resp.getWriter().println("Parameter 'url' is required.");
             return;
         }
 
-        // Экранируем параметр для вывода (XSS)
-        String safeUrlParam = Encode.forHtml(imageUrlParam);
+        // Экранирование для безопасного вывода (XSS)
+        String safeUrlForDisplay = Encode.forHtml(imageUrlParam);
 
-        // Валидация URL
         if (!urlValidator.isValid(imageUrlParam)) {
             resp.setStatus(HttpServletResponse.SC_BAD_REQUEST);
-            resp.getWriter().println("Invalid URL format: " + safeUrlParam);
+            resp.getWriter().println("Invalid URL scheme. Only HTTP/HTTPS allowed: " + safeUrlForDisplay);
             return;
         }
 
@@ -67,91 +73,145 @@ public class SecureImageCacheServlet extends HttpServlet {
             imageUrl = new URL(imageUrlParam);
         } catch (MalformedURLException e) {
             resp.setStatus(HttpServletResponse.SC_BAD_REQUEST);
-            resp.getWriter().println("Malformed URL: " + safeUrlParam);
+            resp.getWriter().println("Malformed URL: " + safeUrlForDisplay);
             return;
         }
 
-        // Проверка на внутренние IP (SSRF)
-        InetAddress addr = InetAddress.getByName(imageUrl.getHost());
-        if (addr.isLoopbackAddress() || addr.isSiteLocalAddress()) {
+        // === 4. Защита от SSRF (проверка на внутренние IP) ===
+        if (isLocalOrPrivateAddress(imageUrl.getHost())) {
             resp.setStatus(HttpServletResponse.SC_BAD_REQUEST);
-            resp.getWriter().println("Access to local/network addresses is forbidden.");
+            resp.getWriter().println("Access to private or loopback addresses is forbidden.");
             return;
         }
 
-        // Проверяем кэш
-        byte[] cachedImage = cache.getIfPresent(imageUrlParam);
+        // === 5. Проверка кэша ===
+        byte[] cachedImage = imageCache.getIfPresent(imageUrlParam);
         if (cachedImage != null) {
-            // Устанавливаем безопасные заголовки
-            resp.setContentType("image/jpeg"); // или определять по MIME-типу, если известен
-            resp.setContentLength(cachedImage.length);
-            try (ServletOutputStream out = resp.getOutputStream()) {
-                out.write(cachedImage);
-            }
+            serveImage(resp, cachedImage, imageUrlParam);
             return;
         }
 
-        // Скачивание
+        // === 6. Безопасная загрузка изображения ===
         byte[] imageData = downloadImageSafely(imageUrl);
         if (imageData == null) {
-            resp.setStatus(HttpServletResponse.SC_NOT_FOUND);
-            resp.getWriter().println("Failed to download image from: " + safeUrlParam);
+            resp.setStatus(HttpServletResponse.SC_BAD_GATEWAY);
+            resp.getWriter().println("Failed to fetch image from: " + safeUrlForDisplay);
             return;
         }
 
-        // Проверка MIME-типа и расширения (опционально)
-        String contentType = URLConnection.guessContentTypeFromStream(new ByteArrayInputStream(imageData));
-        if (contentType == null || !contentType.startsWith("image/")) {
+        // === 7. Проверка MIME-типа (по содержимому, а не расширению) ===
+        String mimeType = detectMimeType(imageData);
+        if (mimeType == null || !isAllowedImageType(mimeType)) {
             resp.setStatus(HttpServletResponse.SC_UNSUPPORTED_MEDIA_TYPE);
-            resp.getWriter().println("Content is not a valid image: " + contentType);
+            resp.getWriter().println("Content is not a supported image type.");
             return;
         }
 
-        // Кэшируем
-        cache.put(imageUrlParam, imageData);
+        // === 8. Кэширование и ответ ===
+        imageCache.put(imageUrlParam, imageData);
+        serveImage(resp, imageData, imageUrlParam);
+    }
 
-        // Устанавливаем безопасные заголовки
-        resp.setContentType(contentType);
-        resp.setContentLength(imageData.length);
-        try (ServletOutputStream out = resp.getOutputStream()) {
-            out.write(imageData);
+    // === Вспомогательные методы ===
+
+    private boolean isValidAuthToken(String authHeader) {
+        // Пример: "Bearer secure-token-123"
+        // В реальном приложении: проверка JWT, OAuth2 и т.д.
+        return authHeader != null && authHeader.equals("Bearer secure-token-123");
+    }
+
+    private boolean isLocalOrPrivateAddress(String host) {
+        try {
+            InetAddress addr = InetAddress.getByName(host);
+            return addr.isAnyLocalAddress() ||
+                   addr.isLoopbackAddress() ||
+                   addr.isLinkLocalAddress() ||
+                   addr.isSiteLocalAddress();
+        } catch (UnknownHostException e) {
+            return false; // Не блокируем, но логируем в продакшене
         }
     }
 
-    private byte[] downloadImageSafely(URL imageUrl) {
+    private byte[] downloadImageSafely(URL url) {
         try {
-            HttpURLConnection connection = (HttpURLConnection) imageUrl.openConnection();
-            connection.setRequestMethod("GET");
-            connection.setConnectTimeout(CONNECT_TIMEOUT);
-            connection.setReadTimeout(READ_TIMEOUT);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
+            conn.setReadTimeout(READ_TIMEOUT_MS);
+            conn.setInstanceFollowRedirects(false); // Защита от SSRF через редиректы
 
-            // Проверка размера файла (опционально, если сервер отдает Content-Length)
-            long contentLength = connection.getContentLengthLong();
-            if (contentLength > MAX_FILE_SIZE) {
+            // Проверка Content-Length (если доступен)
+            long contentLength = conn.getContentLengthLong();
+            if (contentLength > MAX_FILE_SIZE_BYTES) {
                 System.err.println("File too large: " + contentLength + " bytes.");
                 return null;
             }
 
-            try (InputStream in = connection.getInputStream()) {
+            try (InputStream in = conn.getInputStream()) {
                 ByteArrayOutputStream buffer = new ByteArrayOutputStream();
-                byte[] data = new byte[8192];
-                int nRead;
-                long totalRead = 0;
-
-                while ((nRead = in.read(data, 0, data.length)) != -1) {
-                    totalRead += nRead;
-                    if (totalRead > MAX_FILE_SIZE) {
-                        System.err.println("Downloaded file exceeded max size: " + totalRead);
+                byte[] chunk = new byte[8192];
+                long total = 0;
+                int n;
+                while ((n = in.read(chunk)) != -1) {
+                    total += n;
+                    if (total > MAX_FILE_SIZE_BYTES) {
+                        System.err.println("Download exceeded max size: " + total + " bytes.");
                         return null;
                     }
-                    buffer.write(data, 0, nRead);
+                    buffer.write(chunk, 0, n);
                 }
                 return buffer.toByteArray();
             }
         } catch (IOException e) {
-            // Не утечка информации
-            System.err.println("Error downloading image: " + e.getMessage());
+            System.err.println("Download failed: " + e.getMessage());
             return null;
+        }
+    }
+
+    private String detectMimeType(byte[] data) {
+        try (InputStream is = new ByteArrayInputStream(data)) {
+            return URLConnection.guessContentTypeFromStream(is);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    private boolean isAllowedImageType(String mimeType) {
+        return "image/jpeg".equals(mimeType) ||
+               "image/png".equals(mimeType) ||
+               "image/gif".equals(mimeType) ||
+               "image/webp".equals(mimeType);
+    }
+
+    private void serveImage(HttpServletResponse resp, byte[] data, String url) throws IOException {
+        String mimeType = detectMimeType(data);
+        resp.setContentType(mimeType != null ? mimeType : "application/octet-stream");
+        resp.setContentLength(data.length);
+        resp.setHeader("Cache-Control", "public, max-age=3600"); // Кэширование на клиенте
+
+        try (ServletOutputStream out = resp.getOutputStream()) {
+            out.write(data);
+        }
+    }
+
+    private void enforceRateLimit(HttpServletResponse resp) throws IOException {
+        long now = System.currentTimeMillis();
+        long windowMs = RATE_LIMIT_WINDOW_SECONDS * 1000;
+
+        if (now - windowStart > windowMs) {
+            // Новое окно
+            synchronized (this) {
+                if (now - windowStart > windowMs) {
+                    windowStart = now;
+                    requestCount.set(0);
+                }
+            }
+        }
+
+        if (requestCount.incrementAndGet() > MAX_REQUESTS_PER_WINDOW) {
+            resp.setStatus(HttpServletResponse.SC_TOO_MANY_REQUESTS);
+            resp.getWriter().println("Rate limit exceeded. Try again later.");
+            throw new IOException("Rate limit exceeded");
         }
     }
 }
